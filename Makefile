@@ -1,7 +1,7 @@
 .PHONY: all policy-controller docker-image clean
 
 SRCDIR=.
-CONTAINER_NAME=calico/kube-policy-controller
+CONTAINER_NAME=hitomitak/kube-policy-controller-ppc64le
 
 default: all
 all: policy-controller
