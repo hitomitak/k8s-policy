@@ -18,6 +18,7 @@ cd pyinstaller && cd bootloader && python2.7 ./waf distclean all --no-lsb
 cd .. &&  python2.7 setup.py install
 
 # Produce a binary - outputs to /dist/controller
+cd /
 pyinstaller /code/controller.py -ayF
 
 # Cleanup everything that was installed now that we have a self contained binary
