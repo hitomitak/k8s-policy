@@ -1,4 +1,17 @@
-#!/usr/bin/python
+# Copyright (c) 2017 Tigera, Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import logging
 import os
 import Queue
@@ -96,6 +109,11 @@ class Controller(object):
                          update_pod)
         self.add_handler(RESOURCE_TYPE_POD, TYPE_DELETED,
                          delete_pod)
+
+        self._last_resource_version = {}
+        """
+        Keeps track of last received version for each resource type.
+        """
 
     def add_handler(self, resource_type, event_type, handler):
         """
@@ -263,7 +281,7 @@ class Controller(object):
 
                 # Log out when the queue is empty.
                 if self._event_queue.empty():
-                    _log.info("Emptied the event queue")
+                    _log.debug("Emptied the event queue")
 
     def _process_update(self, event_type, resource_type, resource):
         """
@@ -295,18 +313,35 @@ class Controller(object):
     def _manage_resource(self, resource_type):
         """
         Routine for a worker thread.  Syncs with API for the given resource
-        and starts a watch.  If an error occurs within the watch, will re-sync
-        with the API and re-start the watch.
+        and starts a watch.  If an error occurs within the watch, will resync
+        with the API and restart the watch.
         """
+        sync_needed = True
         while True:
             try:
-                # Sync existing resources for this type.
-                resource_version = self._sync_resources(resource_type)
+                if sync_needed:
+                    # Sync existing resources for this type.
+                    self._sync_resources(resource_type)
+
+                # There are many exception conditions below for which we would
+                # need to sync again.  Even though sync isn't needed in the
+                # most mainline case - read timeout - we save some lines of
+                # code by setting sync_needed True here, and resetting it below
+                # in the cases where it isn't needed.
+                sync_needed = True
 
                 # Start a watch from the latest resource_version.
-                self._watch_resource(resource_type, resource_version)
-            except requests.ConnectionError, requests.ChunkedEncodingError:
-                _log.exception("Connection error querying: %s", resource_type)
+                self._watch_resource(resource_type)
+            except requests.exceptions.ConnectTimeout as e:
+                _log.warning("Connection attempt timed out: %s ...%s", resource_type, e)
+            except requests.ConnectionError as e:
+                if "Read timed out" in str(e):
+                    _log.debug("Normal read time out for %s", resource_type)
+                    sync_needed = False
+                else:
+                    _log.warning("Connection error: %s ...%s", resource_type, e)
+            except requests.exceptions.ChunkedEncodingError:
+                _log.exception("Read error querying: %s", resource_type)
             except requests.HTTPError:
                 _log.exception("HTTP error querying: %s", resource_type)
             except KubernetesApiError:
@@ -314,25 +349,31 @@ class Controller(object):
             except Queue.Full:
                 _log.exception("Event queue full")
             except Exception:
-                _log.exception("Unahandled exception killed %s manager", resource_type)
+                _log.exception("Unhandled exception killed %s manager", resource_type)
             finally:
-                # Sleep for a second so that we don't tight-loop.
-                _log.warning("Re-starting watch on resource: %s",
-                             resource_type)
-                time.sleep(1)
+                if sync_needed:
+                    # Sleep for a second so that we don't tight-loop.
+                    _log.info("Restarting watch on resource: %s",
+                              resource_type)
+                    time.sleep(1)
+                else:
+                    _log.debug("Restarting watch on resource: %s",
+                               resource_type)
 
-    def _watch_resource(self, resource_type, resource_version):
+    def _watch_resource(self, resource_type):
         """
         Watch the given resource type starting at the given resource version.
         Add any events to the event queue.
         """
         path = WATCH_URLS[resource_type] % self.k8s_api
-        _log.info("Starting watch on: %s", path)
+        _log.debug("Starting watch on: %s", path)
         while True:
             # Attempt to stream API resources.
-            response = self._api_get(path,
-                                     stream=True,
-                                     resource_version=resource_version)
+            response = self._api_get(
+                path,
+                stream=True,
+                resource_version=self._last_resource_version[resource_type]
+            )
             _log.debug("Watch response for %s: %s", path, response)
 
             # Check for successful response, raise error if not.
@@ -343,8 +384,12 @@ class Controller(object):
             for line in response.iter_lines():
                 # Filter out keep-alive new lines.
                 if line:
-                    _log.debug("Read line: %s", line)
-                    parsed = json.loads(line)
+                    _log.debug("Read from API: %s", line)
+                    try:
+                        parsed = json.loads(line)
+                    except json.JSONDecodeError as e:
+                        _log.error("Bad response '%s' from API: %s", line, e)
+                        raise
 
                     # Check if we've encountered an error.  If so,
                     # raise an exception.
@@ -359,7 +404,7 @@ class Controller(object):
                     resource = parsed["object"]
 
                     # Successful update - send to the queue.
-                    _log.info("%s %s: %s to queue (%s) (%s)",
+                    _log.debug("%s %s: %s to queue (%s) (%s)",
                               event_type,
                               resource_type,
                               resource["metadata"]["name"],
@@ -374,8 +419,9 @@ class Controller(object):
                     # Extract the latest resource version.
                     new_ver = resource["metadata"]["resourceVersion"]
                     _log.debug("Update resourceVersion, was: %s, now: %s",
-                               resource_version, new_ver)
-                    resource_version = new_ver
+                              self._last_resource_version[resource_type],
+                              new_ver)
+                    self._last_resource_version[resource_type] = new_ver
 
     def _sync_resources(self, resource_type):
         """
@@ -405,7 +451,7 @@ class Controller(object):
         # Add the existing resources to the queue to be processed.
         # Treat as a MODIFIED event to trigger updates which may not always
         # occur on ADDED.
-        _log.info("%s existing %s(s) - add to queue",
+        _log.debug("%s existing %s(s) - add to queue",
                   len(resources), resource_type)
         for resource in resources:
             _log.debug("Queueing update: %s", resource)
@@ -414,9 +460,9 @@ class Controller(object):
                                   block=True,
                                   timeout=QUEUE_PUT_TIMEOUT)
 
-        _log.info("Done getting %s(s) - new resourceVersion: %s",
+        _log.info("Done syncing %s(s) - new resourceVersion: %s",
                   resource_type, resource_version)
-        return resource_version
+        self._last_resource_version[resource_type] = resource_version
 
     def _api_get(self, path, stream, resource_version=None):
         """
@@ -439,7 +485,7 @@ class Controller(object):
         if self.auth_token:
             session.headers.update({'Authorization': 'Bearer ' + self.auth_token})
         verify = CA_CERT_PATH if self.ca_crt_exists else False
-        return session.get(path, verify=verify, stream=stream)
+        return session.get(path, verify=verify, stream=stream, timeout=(5, 10))
 
     def _is_leader(self):
         """
